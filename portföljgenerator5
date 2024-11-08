@@ -1,0 +1,119 @@
+import yfinance as yf
+import cvxpy as cp
+import numpy as np
+import pandas as pd
+from datetime import datetime
+from textblob import TextBlob
+from arch import arch_model
+from scipy.stats import norm
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split
+
+# Hämta nyhetsartiklar och kör sentimentanalys
+def get_sentiment_score(ticker):
+    # För demonstration, använd en statisk lista eller API-förfrågningar för nyhetsrubriker
+    headlines = [
+        f"Positive sentiment on {ticker}",
+        f"{ticker} earnings show growth",
+        f"Concerns over {ticker}'s future",
+    ]
+    sentiment_score = 0
+    for headline in headlines:
+        sentiment_score += TextBlob(headline).sentiment.polarity
+    return sentiment_score / len(headlines)
+
+# Funktion för att hämta och bearbeta data med EWMA och GARCH för volatilitet
+def load_data(symbols, start_date="2022-01-01", end_date=datetime.today().strftime('%Y-%m-%d'), decay=0.94):
+    data = yf.download(symbols, start=start_date, end=end_date)
+    adj_close = data['Adj Close']
+    daily_returns = adj_close.pct_change().dropna()
+    
+    # Beräkna årlig avkastning
+    annual_returns = daily_returns.mean() * 252
+    
+    # GARCH-modell för volatilitet
+    garch_volatility = {}
+    for symbol in symbols:
+        model = arch_model(daily_returns[symbol] * 100, vol='Garch', p=1, q=1)
+        garch_fitted = model.fit(disp="off")
+        garch_volatility[symbol] = garch_fitted.conditional_volatility[-1] / 100
+    
+    # Kovariansmatris baserad på GARCH-volatilitet
+    vol_array = np.array([garch_volatility[symbol] for symbol in symbols])
+    cov_matrix = np.outer(vol_array, vol_array) * daily_returns.corr().values
+    return annual_returns, cov_matrix, data
+
+# Funktion för maskininlärning och prediktion av avkastning
+def predict_returns(data, symbols):
+    predictions = {}
+    for symbol in symbols:
+        returns = data['Adj Close'][symbol].pct_change().dropna()
+        X = np.arange(len(returns)).reshape(-1, 1)
+        y = returns.values
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+        
+        model = RandomForestRegressor(n_estimators=100, random_state=42)
+        model.fit(X_train, y_train)
+        predicted_return = model.predict([[len(returns)]])[0]  # Förutspå nästa period
+        predictions[symbol] = predicted_return
+    return predictions
+
+# Funktion för att generera signaler baserat på sentiment, teknisk och prediktiv analys
+def generate_signals(fundamentals, predictions, sentiment_scores):
+    signals = {}
+    for symbol in fundamentals.index:
+        buy_signal = (
+            fundamentals.loc[symbol, "PE"] < 15 and
+            fundamentals.loc[symbol, "Profit Growth"] > 0.1 and
+            predictions[symbol] > 0 and
+            sentiment_scores[symbol] > 0
+        )
+        signals[symbol] = "Buy" if buy_signal else "Hold"
+    return signals
+
+# Hämta inputdata från användaren
+symbols = input("Ange aktiesymboler, separerade med kommatecken (t.ex. 'AAPL, MSFT, TSLA'): ").split(',')
+risk_free_rate = float(input("Ange årlig riskfri ränta (%) (t.ex. 2 för 2%): ")) / 100
+total_capital = float(input("Ange totalt investerbart kapital i kronor: "))
+
+# Hämta data
+annual_returns, cov_matrix, data = load_data(symbols)
+fundamentals = get_fundamental_data(symbols)
+predictions = predict_returns(data, symbols)
+sentiment_scores = {symbol: get_sentiment_score(symbol) for symbol in symbols}
+signals = generate_signals(fundamentals, predictions, sentiment_scores)
+
+# Visa köp/säljsignaler
+print("\nKöp/säljsignaler baserat på fundamentala, tekniska och sentimentdata:")
+for symbol, signal in signals.items():
+    print(f"{symbol}: {signal}")
+
+# Optimera portföljen med CVaR och sentimentviktning
+buy_symbols = [symbol for symbol, signal in signals.items() if signal == "Buy"]
+if buy_symbols:
+    buy_indices = [symbols.index(sym) for sym in buy_symbols]
+    filtered_returns = annual_returns[buy_indices]
+    filtered_cov_matrix = cov_matrix[buy_indices, :][:, buy_indices]
+    
+    weights = cp.Variable(len(buy_symbols))
+    portfolio_return = filtered_returns.values @ weights
+    portfolio_risk = cp.quad_form(weights, filtered_cov_matrix)
+    
+    # CVaR-optimering
+    alpha = 0.05
+    VaR = -norm.ppf(1 - alpha) * cp.sqrt(portfolio_risk)
+    CVaR = VaR + (norm.pdf(norm.ppf(1 - alpha)) / (1 - alpha)) * cp.sqrt(portfolio_risk)
+    objective = cp.Maximize((portfolio_return - risk_free_rate) / CVaR)
+    
+    # Begränsningar
+    constraints = [cp.sum(weights) == 1, weights >= 0]
+    problem = cp.Problem(objective, constraints)
+    problem.solve()
+    
+    # Visa optimal fördelning
+    print("\nOptimal fördelning för aktier med köpsignal:")
+    for i, weight in enumerate(weights.value):
+        capital_investment = weight * total_capital
+        print(f"{buy_symbols[i]}: {weight:.2%} - {capital_investment:.2f} kr")
+else:
+    print("Inga aktier med köpsignal för tillfället.")

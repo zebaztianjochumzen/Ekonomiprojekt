@@ -1,0 +1,146 @@
+import yfinance as yf
+import cvxpy as cp
+import numpy as np
+import pandas as pd
+from datetime import datetime
+from scipy.stats import norm
+
+# Funktion för att hämta och bearbeta data med EWMA för volatilitet
+def load_data(symbols, start_date="2022-01-01", end_date=datetime.today().strftime('%Y-%m-%d'), decay=0.94):
+    data = yf.download(symbols, start=start_date, end=end_date)
+    adj_close = data['Adj Close']
+    daily_returns = adj_close.pct_change().dropna()
+    
+    # Beräkna årlig avkastning och EWMA-baserad kovariansmatris
+    annual_returns = daily_returns.mean() * 252
+    ewma_cov_matrix = daily_returns.ewm(span=int((2 / (1 - decay)) - 1)).cov().iloc[-len(symbols):, :]
+    
+    return annual_returns, ewma_cov_matrix, data
+
+# Funktion för att hämta fundamentala data och fler nyckeltal
+def get_fundamental_data(symbols):
+    fundamental_data = {}
+    for symbol in symbols:
+        stock = yf.Ticker(symbol)
+        pe_ratio = stock.info.get("trailingPE", None)
+        pb_ratio = stock.info.get("priceToBook", None)
+        roe = stock.info.get("returnOnEquity", None)
+        dividend_yield = stock.info.get("dividendYield", None)
+        profit_growth = stock.info.get("earningsGrowth", None)
+        debt_ratio = stock.info.get("debtToEquity", None)
+        fundamental_data[symbol] = {
+            "PE": pe_ratio,
+            "PB": pb_ratio,
+            "ROE": roe,
+            "Dividend Yield": dividend_yield,
+            "Profit Growth": profit_growth,
+            "Debt Ratio": debt_ratio
+        }
+    return pd.DataFrame(fundamental_data).T
+
+# Funktion för att beräkna tekniska indikatorer
+def calculate_technical_indicators(data, symbol):
+    # Glidande medelvärden och Bollinger Bands
+    short_ma = data['Adj Close'][symbol].rolling(window=20).mean()
+    long_ma = data['Adj Close'][symbol].rolling(window=50).mean()
+    bollinger_upper = short_ma + (data['Adj Close'][symbol].rolling(window=20).std() * 2)
+    bollinger_lower = short_ma - (data['Adj Close'][symbol].rolling(window=20).std() * 2)
+    
+    # RSI och ATR
+    delta = data['Adj Close'][symbol].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / loss
+    rsi = 100 - (100 / (1 + rs))
+    
+    # MACD och signal
+    ema12 = data['Adj Close'][symbol].ewm(span=12, adjust=False).mean()
+    ema26 = data['Adj Close'][symbol].ewm(span=26, adjust=False).mean()
+    macd = ema12 - ema26
+    signal = macd.ewm(span=9, adjust=False).mean()
+    
+    # Average True Range (ATR)
+    high_low = data['High'][symbol] - data['Low'][symbol]
+    high_close = np.abs(data['High'][symbol] - data['Adj Close'][symbol].shift())
+    low_close = np.abs(data['Low'][symbol] - data['Adj Close'][symbol].shift())
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    atr = tr.rolling(window=14).mean()
+    
+    return {
+        "Short MA": short_ma.iloc[-1],
+        "Long MA": long_ma.iloc[-1],
+        "Bollinger Upper": bollinger_upper.iloc[-1],
+        "Bollinger Lower": bollinger_lower.iloc[-1],
+        "RSI": rsi.iloc[-1],
+        "MACD": macd.iloc[-1],
+        "Signal": signal.iloc[-1],
+        "ATR": atr.iloc[-1]
+    }
+
+# Generera köp/säljsignaler baserat på kombinerade analyser
+def generate_signals(fundamentals, technicals):
+    signals = {}
+    for symbol in fundamentals.index:
+        # Fundamentala signaler
+        buy_signal_fundamental = (
+            fundamentals.loc[symbol, "PE"] < 15 and
+            fundamentals.loc[symbol, "PB"] < 1.5 and
+            fundamentals.loc[symbol, "ROE"] > 0.1 and
+            fundamentals.loc[symbol, "Profit Growth"] > 0.1 and
+            fundamentals.loc[symbol, "Debt Ratio"] < 1
+        )
+        
+        # Tekniska signaler
+        tech = technicals[symbol]
+        buy_signal_technical = (
+            tech["Short MA"] > tech["Long MA"] and
+            tech["RSI"] < 30 and
+            tech["MACD"] > tech["Signal"] and
+            tech["ATR"] < tech["Bollinger Upper"]
+        )
+        
+        signals[symbol] = "Buy" if buy_signal_fundamental and buy_signal_technical else "Hold"
+    return signals
+
+# Hämta inputdata från användaren
+symbols = input("Ange aktiesymboler, separerade med kommatecken (t.ex. 'AAPL, MSFT, TSLA'): ").split(',')
+risk_free_rate = float(input("Ange årlig riskfri ränta (%) (t.ex. 2 för 2%): ")) / 100
+total_capital = float(input("Ange totalt investerbart kapital i kronor: "))
+
+# Hämta och bearbeta data
+annual_returns, ewma_cov_matrix, data = load_data(symbols)
+fundamentals = get_fundamental_data(symbols)
+technicals = {symbol: calculate_technical_indicators(data, symbol) for symbol in symbols}
+signals = generate_signals(fundamentals, technicals)
+
+# Visa köp/säljsignaler
+print("\nKöp/säljsignaler baserat på fundamentala och tekniska indikatorer:")
+for symbol, signal in signals.items():
+    print(f"{symbol}: {signal}")
+
+# Optimera portföljen baserat på de aktier som fått köpsignal
+buy_symbols = [symbol for symbol, signal in signals.items() if signal == "Buy"]
+if buy_symbols:
+    # Begränsa optimeringen till endast köpsignal-aktier
+    buy_indices = [symbols.index(sym) for sym in buy_symbols]
+    filtered_returns = annual_returns[buy_indices]
+    filtered_cov_matrix = ewma_cov_matrix.iloc[buy_indices, buy_indices]
+    
+    # Portföljoptimering med dynamiska vikter
+    weights = cp.Variable(len(buy_symbols))
+    portfolio_return = filtered_returns.values @ weights
+    portfolio_risk = cp.quad_form(weights, filtered_cov_matrix.values)
+    
+    # Maximera Sharpe-kvoten och justera vikter baserat på signalstyrka
+    objective = cp.Maximize((portfolio_return - risk_free_rate) / cp.sqrt(portfolio_risk))
+    constraints = [cp.sum(weights) == 1, weights >= 0]
+    problem = cp.Problem(objective, constraints)
+    problem.solve()
+    
+    # Visa optimal fördelning
+    print("\nOptimal fördelning för aktier med köpsignal:")
+    for i, weight in enumerate(weights.value):
+        capital_investment = weight * total_capital
+        print(f"{buy_symbols[i]}: {weight:.2%} - {capital_investment:.2f} kr")
+else:
+    print("Inga aktier med köpsignal för tillfället.")
